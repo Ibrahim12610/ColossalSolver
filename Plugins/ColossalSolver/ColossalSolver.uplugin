@@ -1,0 +1,24 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "ColossalSolver",
+	"Description": "An anatomy-agnostic procedural animation framework built to eliminate kinematic discontinuity and foot-sliding in large-scale game entities. Implements multi-directional surface conformity array sensing, real-time center of mass displacement tracking, and predictive physical bracing mechanisms.",
+	"Category": "Other",
+	"CreatedBy": "Ibrahim Faisal",
+	"CreatedByURL": "https://github.com/Ibrahim12610",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"CanContainContent": true,
+	"IsBetaVersion": true,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "ColossalSolver",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	]
+}
