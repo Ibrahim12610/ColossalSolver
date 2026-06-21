@@ -1,4 +1,3 @@
-
 #include "UColossalDetectorComponent.h"
 #include "DrawDebugHelpers.h"
 #include "Components/SkeletalMeshComponent.h"
@@ -24,11 +23,10 @@ void UUColossalDetectorComponent::BeginPlay()
     {
         CachedBoneCount = OwnerMesh->GetNumBones();
 
-        // Initialize stable trace origins from the reference pose once at start.
-        // Traces for all effectors (feet AND hands) are anchored to this position
-        // tracked via actor movement delta — never the live IK-modified bone position.
-        // This breaks the feedback loop where IK output feeds back into trace input
-        // causing the flicker that was previously only fixed for feet.
+        // Initialize stable trace origins from the reference pose once.
+        // Traces are anchored to this position tracked via actor movement delta —
+        // never the live IK-modified bone position. Breaks the feedback loop
+        // where IK output feeds back into trace input (the flicker bug).
         for (FColossalEffectorTarget& Target : EffectorTargets)
         {
             if (OwnerMesh->GetBoneIndex(Target.BoneName) != INDEX_NONE)
@@ -39,6 +37,29 @@ void UUColossalDetectorComponent::BeginPlay()
             }
         }
     }
+}
+
+FVector UUColossalDetectorComponent::CalculatePoleVector(FName BendBoneName, float Distance, bool bInvertDirection)
+{
+    if (!OwnerMesh) return FVector::ZeroVector;
+
+    int32 BoneIndex = OwnerMesh->GetBoneIndex(BendBoneName);
+    if (BoneIndex == INDEX_NONE) return FVector::ZeroVector;
+
+    FTransform BoneTransform = OwnerMesh->GetBoneTransform(
+        BendBoneName, ERelativeTransformSpace::RTS_World);
+
+    // GetUnitAxis always returns a proper unit-length vector regardless of any
+    // scale on the bone transform. This avoids the bug where rotating a vector
+    // and then multiplying component-wise by (1,1,1000) produced a near-zero
+    // magnitude result for two of the three axes.
+    FVector BendDirection = BoneTransform.GetUnitAxis(EAxis::Y);
+
+    float SignedDistance = bInvertDirection ? -Distance : Distance;
+
+    // Single scalar multiply on the whole vector — correct uniform scaling,
+    // no component-wise multiplication error possible here.
+    return BoneTransform.GetLocation() + (BendDirection * SignedDistance);
 }
 
 void UUColossalDetectorComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
@@ -59,10 +80,19 @@ void UUColossalDetectorComponent::TickComponent(float DeltaTime, ELevelTick Tick
     DrawDebugLine(World, CachedCenterOfMass, CachedCenterOfMass + (FVector::DownVector * 500.0f), FColor::Orange, false, 0.5f, 0, 1.5f);
     LogTelemetryMessage(99, FString::Printf(TEXT("Center of Mass: %s"), *CachedCenterOfMass.ToString()), FColor::Yellow);
 
-    // Actor movement delta — how far the actor has moved since BeginPlay.
-    // Applied to each effector's StableTraceOrigin so traces track overall movement
-    // (walking, falling) while remaining independent of IK-modified bone positions.
-    // Applied to BOTH feet and hands to fix flickering on arms too.
+    // Calculate pole vectors once per frame in C++. Each call is independently
+    // scoped with its own bone name argument — no shared state between left and
+    // right, which is what caused the cross-contamination bug in the graph version.
+    LeftPoleVectorPosition = CalculatePoleVector(LeftCalfBoneName, PoleVectorDistance, bInvertLeftPoleDirection);
+    RightPoleVectorPosition = CalculatePoleVector(RightCalfBoneName, PoleVectorDistance, bInvertRightPoleDirection);
+
+    DrawDebugSphere(World, LeftPoleVectorPosition, 50.0f, 8, FColor::Magenta, false, 0.5f, 0, 2.0f);
+    DrawDebugSphere(World, RightPoleVectorPosition, 50.0f, 8, FColor::Cyan, false, 0.5f, 0, 2.0f);
+    LogTelemetryMessage(70, FString::Printf(TEXT("PoleL: %s | PoleR: %s"),
+        *LeftPoleVectorPosition.ToString(), *RightPoleVectorPosition.ToString()), FColor::White);
+
+    // Actor movement delta — tracks overall actor movement (walking, falling)
+    // independent of what Control Rig does to individual bone positions.
     FVector ActorDelta = GetOwner()->GetActorLocation() - InitialActorLocation;
 
     for (FColossalEffectorTarget& Target : EffectorTargets)
@@ -77,15 +107,14 @@ void UUColossalDetectorComponent::TickComponent(float DeltaTime, ELevelTick Tick
         if (Target.CalculatedImpactPoint.IsNearlyZero())
             Target.CalculatedImpactPoint = BoneWorldPos;
 
-        // Fallback if stable origin was never initialized
         if (!Target.bStableOriginInitialized)
         {
             Target.StableTraceOrigin = BoneWorldPos - ActorDelta;
             Target.bStableOriginInitialized = true;
         }
 
-        // Stable origin for this frame — reference pose position plus actor movement.
-        // Same logic for feet and hands — breaks feedback loop for both.
+        // Stable origin for this frame — independent of live IK-modified bone position.
+        // Applied to BOTH feet and hands to prevent flickering on either.
         FVector StableOrigin = Target.StableTraceOrigin + ActorDelta;
 
         FVector TraceStart;
@@ -95,8 +124,6 @@ void UUColossalDetectorComponent::TickComponent(float DeltaTime, ELevelTick Tick
 
         if (Target.LimbType == EColossalLimbType::Foot)
         {
-            // Start 600 above stable origin — guarantees trace starts above terrain
-            // even when the capsule sinks slightly into uneven rocky surfaces
             TraceStart = FVector(StableOrigin.X, StableOrigin.Y, StableOrigin.Z + 600.0f);
             TraceEnd = TraceStart + (FVector::DownVector * Target.TraceLength);
 
@@ -105,7 +132,6 @@ void UUColossalDetectorComponent::TickComponent(float DeltaTime, ELevelTick Tick
                 HitResult, TraceStart, TraceEnd,
                 FQuat::Identity, ECC_Visibility, SweepSphere, TraceParams);
 
-            // Debug visualization
             DrawDebugLine(World, TraceStart, TraceEnd, FColor::White, false, 0.5f, 0, 1.0f);
             DrawDebugSphere(World, TraceStart, Target.SweepSphereRadius, 8, FColor::White, false, 0.5f, 0, 1.0f);
 
@@ -119,31 +145,22 @@ void UUColossalDetectorComponent::TickComponent(float DeltaTime, ELevelTick Tick
                 DrawDebugSphere(World, TraceEnd, Target.SweepSphereRadius, 8, FColor::Green, false, 0.5f, 0, 1.0f);
             }
 
-            // Diagnostic log — ImpactZ vs BoneZ vs StableZ
             LogTelemetryMessage(
                 60 + BoneIndex,
                 FString::Printf(TEXT("%s | ImpactZ: %.0f | BoneZ: %.0f | StableZ: %.0f"),
                     *Target.BoneName.ToString(),
-                    Target.CalculatedImpactPoint.Z,
-                    BoneWorldPos.Z,
-                    StableOrigin.Z),
+                    Target.CalculatedImpactPoint.Z, BoneWorldPos.Z, StableOrigin.Z),
                 FColor::Cyan
             );
         }
         else if (Target.LimbType == EColossalLimbType::HandArm)
         {
-            // Hands use stable origin for trace start — same fix as feet.
-            // Stable origin tracks actor movement without being affected by
-            // whatever Control Rig does to the hand/arm bones each frame.
+            // Hands use stable origin too — same flicker fix as feet
             TraceStart = StableOrigin;
 
             FVector SenseDirection;
-
             if (Target.bUseDirectionOverride && !Target.TraceDirectionOverride.IsNearlyZero())
             {
-                // Use the bone's current orientation to transform the local-space override
-                // into world space. Bone orientation from BoneTransform is fine here —
-                // we only use it for direction, not for the trace start position.
                 SenseDirection = BoneTransform.TransformVector(
                     Target.TraceDirectionOverride.GetSafeNormal());
             }
@@ -153,7 +170,6 @@ void UUColossalDetectorComponent::TickComponent(float DeltaTime, ELevelTick Tick
                 FVector OutwardDirection = BoneTransform.GetUnitAxis(EAxis::Y);
                 SenseDirection = (ForwardDirection * 0.7f + OutwardDirection * 0.3f).GetSafeNormal();
             }
-
             if (SenseDirection.IsNearlyZero()) SenseDirection = FVector::ForwardVector;
             TraceEnd = TraceStart + (SenseDirection * Target.TraceLength);
 
@@ -175,14 +191,11 @@ void UUColossalDetectorComponent::TickComponent(float DeltaTime, ELevelTick Tick
                 DrawDebugSphere(World, TraceEnd, Target.SweepSphereRadius, 8, FColor::Green, false, 0.5f, 0, 1.0f);
             }
 
-            // Diagnostic log for hands
             LogTelemetryMessage(
                 60 + BoneIndex,
                 FString::Printf(TEXT("%s | ImpactZ: %.0f | BoneZ: %.0f | StableZ: %.0f"),
                     *Target.BoneName.ToString(),
-                    Target.CalculatedImpactPoint.Z,
-                    BoneWorldPos.Z,
-                    StableOrigin.Z),
+                    Target.CalculatedImpactPoint.Z, BoneWorldPos.Z, StableOrigin.Z),
                 FColor::Magenta
             );
         }
@@ -215,38 +228,13 @@ void UUColossalDetectorComponent::TickComponent(float DeltaTime, ELevelTick Tick
 
             Target.CalculatedImpactPoint = HitResult.ImpactPoint;
 
-            // Correction delta — the offset needed from stable origin to impact point.
-            // Use this in Control Rig instead of CalculatedImpactPoint directly.
-            // Apply as: Get Bone Transform (Global) Translation + CorrectionDelta
-            // This works correctly regardless of mesh scale because it is a relative
-            // offset, not an absolute world position.
+            // Correction delta — relative offset, scaled by per-effector CorrectionScale.
+            // Use in Control Rig as: CurrentBoneGlobalTranslation + CorrectionDelta
             Target.CorrectionDelta = FVector(
                 HitResult.ImpactPoint.X - StableOrigin.X,
                 HitResult.ImpactPoint.Y - StableOrigin.Y,
                 HitResult.ImpactPoint.Z - StableOrigin.Z
-            );
-
-            // Route correction deltas to named output variables for clean Control Rig access
-            if (Target.BoneName == FName("foot_l"))
-            {
-                LeftFootCorrectionDelta = Target.CorrectionDelta;
-                LeftAnkleTargetRotation = Target.CalculatedDeltaRotation;
-            }
-            else if (Target.BoneName == FName("foot_r"))
-            {
-                RightFootCorrectionDelta = Target.CorrectionDelta;
-                RightAnkleTargetRotation = Target.CalculatedDeltaRotation;
-            }
-            else if (Target.BoneName == FName("hand_l"))
-            {
-                LeftHandCorrectionDelta = Target.CorrectionDelta;
-                LeftWristTargetRotation = Target.CalculatedDeltaRotation;
-            }
-            else if (Target.BoneName == FName("hand_r"))
-            {
-                RightHandCorrectionDelta = Target.CorrectionDelta;
-                RightWristTargetRotation = Target.CalculatedDeltaRotation;
-            }
+            ) * Target.CorrectionScale;
         }
         else
         {
@@ -256,33 +244,35 @@ void UUColossalDetectorComponent::TickComponent(float DeltaTime, ELevelTick Tick
             Target.CalculatedDeltaRotation = FMath::RInterpTo(
                 Target.CalculatedDeltaRotation, FRotator::ZeroRotator, DeltaTime, 8.0f);
 
-            // Smoothly return correction delta to zero when no surface detected
             Target.CorrectionDelta = FMath::VInterpTo(
                 Target.CorrectionDelta, FVector::ZeroVector, DeltaTime, 8.0f);
 
-            // Route zeroing deltas to named outputs too
-            if (Target.BoneName == FName("foot_l"))
-            {
-                LeftFootCorrectionDelta = Target.CorrectionDelta;
-                LeftAnkleTargetRotation = Target.CalculatedDeltaRotation;
-            }
-            else if (Target.BoneName == FName("foot_r"))
-            {
-                RightFootCorrectionDelta = Target.CorrectionDelta;
-                RightAnkleTargetRotation = Target.CalculatedDeltaRotation;
-            }
-            else if (Target.BoneName == FName("hand_l"))
-            {
-                LeftHandCorrectionDelta = Target.CorrectionDelta;
-                LeftWristTargetRotation = Target.CalculatedDeltaRotation;
-            }
-            else if (Target.BoneName == FName("hand_r"))
-            {
-                RightHandCorrectionDelta = Target.CorrectionDelta;
-                RightWristTargetRotation = Target.CalculatedDeltaRotation;
-            }
-
             // CalculatedImpactPoint holds last valid position intentionally
+        }
+
+        // Route to named outputs and the map — both available for Control Rig
+        CorrectionTranslations.Add(Target.BoneName, Target.CorrectionDelta);
+        CorrectionRotations.Add(Target.BoneName, Target.CalculatedDeltaRotation);
+
+        if (Target.BoneName == FName("foot_l"))
+        {
+            LeftFootCorrectionDelta = Target.CorrectionDelta;
+            LeftAnkleTargetRotation = Target.CalculatedDeltaRotation;
+        }
+        else if (Target.BoneName == FName("foot_r"))
+        {
+            RightFootCorrectionDelta = Target.CorrectionDelta;
+            RightAnkleTargetRotation = Target.CalculatedDeltaRotation;
+        }
+        else if (Target.BoneName == FName("hand_l"))
+        {
+            LeftHandCorrectionDelta = Target.CorrectionDelta;
+            LeftWristTargetRotation = Target.CalculatedDeltaRotation;
+        }
+        else if (Target.BoneName == FName("hand_r"))
+        {
+            RightHandCorrectionDelta = Target.CorrectionDelta;
+            RightWristTargetRotation = Target.CalculatedDeltaRotation;
         }
     }
 }
