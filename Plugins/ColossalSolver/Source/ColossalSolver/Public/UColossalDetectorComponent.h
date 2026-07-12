@@ -6,73 +6,6 @@
 
 class USkeletalMeshComponent;
 
-UENUM(BlueprintType)
-enum class EColossalLimbType : uint8
-{
-    Foot    UMETA(DisplayName = "Foot (Downward Sense)"),
-    HandArm UMETA(DisplayName = "Hand/Arm (Forward/Lateral Sense)")
-};
-
-USTRUCT(BlueprintType)
-struct FColossalEffectorTarget
-{
-    GENERATED_BODY()
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Colossal Solver")
-    FName BoneName;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Colossal Solver")
-    EColossalLimbType LimbType;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Colossal Solver")
-    float TraceLength = 150.0f;
-
-    // Radius of the sphere sweep — tune per effector in editor without recompiling
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Colossal Solver")
-    float SweepSphereRadius = 150.0f;
-
-    // Multiplier applied to CorrectionDelta. 1.0 = full correction.
-    // Tune live in editor to fix over/under-correction.
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Colossal Solver")
-    float CorrectionScale = 1.0f;
-
-    // Direction override for hand/arm traces in bone local space
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Colossal Solver")
-    FVector TraceDirectionOverride = FVector::ZeroVector;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Colossal Solver")
-    bool bUseDirectionOverride = false;
-
-    // Runtime outputs — VisibleAnywhere prevents editor refresh instability
-    UPROPERTY(VisibleAnywhere, BlueprintReadWrite, Category = "Colossal Solver")
-    FRotator CalculatedDeltaRotation = FRotator::ZeroRotator;
-
-    UPROPERTY(VisibleAnywhere, BlueprintReadWrite, Category = "Colossal Solver")
-    FVector CalculatedImpactPoint = FVector::ZeroVector;
-
-    // Correction delta — relative offset from stable origin to impact point.
-    // Use this in Control Rig instead of CalculatedImpactPoint directly.
-    UPROPERTY(VisibleAnywhere, BlueprintReadWrite, Category = "Colossal Solver")
-    FVector CorrectionDelta = FVector::ZeroVector;
-
-    UPROPERTY(VisibleAnywhere, BlueprintReadWrite, Category = "Colossal Solver")
-    bool bIsColliding = false;
-
-    UPROPERTY(VisibleAnywhere, BlueprintReadWrite, Category = "Colossal Solver")
-    FRotator CurrentSmoothedRotation = FRotator::ZeroRotator;
-
-    UPROPERTY(VisibleAnywhere, BlueprintReadWrite, Category = "Colossal Solver")
-    FVector SmoothedNormal = FVector::UpVector;
-
-    // Stable trace origin — set once in BeginPlay from reference pose,
-    // tracked via actor movement delta to break the IK feedback loop
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Colossal Solver | Internal")
-    FVector StableTraceOrigin = FVector::ZeroVector;
-
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Colossal Solver | Internal")
-    bool bStableOriginInitialized = false;
-};
-
 UCLASS(ClassGroup=(Custom), meta=(BlueprintSpawnableComponent))
 class COLOSSALSOLVER_API UUColossalDetectorComponent : public UActorComponent
 {
@@ -87,93 +20,104 @@ protected:
 public:
     virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
 
-    FRotator CalculateAnkleRotation(const FVector& FootForward, const FVector& SurfaceNormal);
-    FVector CalculateCenterOfMass();
+    // === SETUP ===
 
-    // Calculates a pole vector world position offset from a given bone along its
-    // local bend axis. Uses GetUnitAxis (always a proper unit vector) and a single
-    // scalar multiply — avoids the component-wise vector*vector bug that produced
-    // near-zero magnitude offsets when done in the Control Rig graph.
-    UFUNCTION(BlueprintCallable, Category = "Colossal Solver")
-    FVector CalculatePoleVector(FName BendBoneName, float Distance, bool bInvertDirection);
+    // The IK foot bone names on your skeleton — same pattern as ik_foot_l/ik_foot_r on Mannequin
+    // On Grux check your skeleton for IK foot bones, or create virtual bones
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Colossal Solver | Setup")
+    FName LeftIKFootBoneName = FName("ik_foot_l");
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Colossal Solver | Setup")
-    TArray<FColossalEffectorTarget> EffectorTargets;
+    FName RightIKFootBoneName = FName("ik_foot_r");
 
+    // How far above the IK foot bone to start the trace
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Colossal Solver | Setup")
-    float AirTimeThreshold = 2000.0f;
+    float TraceStartOffset = 600.0f;
 
-    // --- Pole vector setup ---
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Colossal Solver | Pole Vectors")
-    FName LeftCalfBoneName = FName("calf_l");
+    // How far down to trace for terrain
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Colossal Solver | Setup")
+    float TraceLength = 2000.0f;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Colossal Solver | Pole Vectors")
-    FName RightCalfBoneName = FName("calf_r");
+    // Sphere sweep radius — larger catches more terrain geometry
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Colossal Solver | Setup")
+    float SweepSphereRadius = 150.0f;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Colossal Solver | Pole Vectors")
-    float PoleVectorDistance = 1000.0f;
+    // Scale the final offset — tune in editor to prevent over/under correction
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Colossal Solver | Setup")
+    float CorrectionScale = 1.0f;
 
-    // Independent per-leg inversion toggles — fixes mirrored skeleton axis issues
-    // without needing to touch Control Rig graph wiring
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Colossal Solver | Pole Vectors")
-    bool bInvertLeftPoleDirection = false;
+    // Interpolation speed toward target — matches Mannequin's 15.0
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Colossal Solver | Setup")
+    float InterpSpeedIncreasing = 15.0f;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Colossal Solver | Pole Vectors")
-    bool bInvertRightPoleDirection = false;
+    // Interpolation speed returning to zero
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Colossal Solver | Setup")
+    float InterpSpeedDecreasing = 15.0f;
 
+    // Master switch — when false resets all offsets to 0 (control condition)
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Colossal Solver | Setup")
+    bool bShouldDoIKTrace = true;
+
+    // === STEP 1 OUTPUTS: Raw Z offset targets from trace ===
+    // These are what the trace found — before interpolation
+    // Matches ZOffset_L_Target and ZOffset_R_Target in Mannequin IK
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Colossal Solver | Step 1 Targets")
+    float ZOffsetL_Target = 0.0f;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Colossal Solver | Step 1 Targets")
+    float ZOffsetR_Target = 0.0f;
+
+    // === STEP 2 OUTPUTS: Smoothed/interpolated Z offsets ===
+    // These are what you feed into Modify Transforms in Control Rig
+    // Matches ZOffset_L and ZOffset_R after Alpha Interpolate in Mannequin IK
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Colossal Solver | Step 2 Smoothed")
+    float ZOffsetL = 0.0f;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Colossal Solver | Step 2 Smoothed")
+    float ZOffsetR = 0.0f;
+
+    // === STEP 3 OUTPUT: Pelvis offset ===
+    // Lowest of the two foot offsets — prevents overextension
+    // Matches ZOffset_Pelvis in Mannequin IK
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Colossal Solver | Step 3 Pelvis")
+    float ZOffsetPelvis = 0.0f;
+
+    // === SURFACE NORMAL OUTPUTS: For foot rotation after FBIK ===
+    // Feed into Set Rotation on foot bones after FBIK solves
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Colossal Solver | Rotation")
+    FRotator LeftFootRotation = FRotator::ZeroRotator;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Colossal Solver | Rotation")
+    FRotator RightFootRotation = FRotator::ZeroRotator;
+
+    // === TELEMETRY ===
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Colossal Solver | Telemetry")
     FVector CachedCenterOfMass;
 
-    // --- Pole vector outputs — read these directly in Control Rig ---
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Colossal Solver | Output")
-    FVector LeftPoleVectorPosition;
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Colossal Solver | Telemetry")
+    bool bLeftFootHit = false;
 
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Colossal Solver | Output")
-    FVector RightPoleVectorPosition;
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Colossal Solver | Telemetry")
+    bool bRightFootHit = false;
 
-    // --- Named correction delta / rotation outputs ---
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Colossal Solver | Output")
-    FVector LeftFootCorrectionDelta;
-
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Colossal Solver | Output")
-    FVector RightFootCorrectionDelta;
-
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Colossal Solver | Output")
-    FVector LeftHandCorrectionDelta;
-
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Colossal Solver | Output")
-    FVector RightHandCorrectionDelta;
-
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Colossal Solver | Output")
-    FRotator LeftAnkleTargetRotation;
-
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Colossal Solver | Output")
-    FRotator RightAnkleTargetRotation;
-
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Colossal Solver | Output")
-    FRotator LeftWristTargetRotation;
-
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Colossal Solver | Output")
-    FRotator RightWristTargetRotation;
-
-    // Single map of correction deltas keyed by bone name — alternative to named
-    // outputs above. In Control Rig: Get this map, Find with bone name as key.
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Colossal Solver | Output")
-    TMap<FName, FVector> CorrectionTranslations;
-
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Colossal Solver | Output")
-    TMap<FName, FRotator> CorrectionRotations;
+    FVector CalculateCenterOfMass();
 
 private:
     UPROPERTY()
     USkeletalMeshComponent* OwnerMesh = nullptr;
 
     int32 CachedBoneCount = 0;
-    bool bIsGrounded = false;
-    int32 AirFrameCount = 0;
 
-    UPROPERTY()
-    FVector InitialActorLocation = FVector::ZeroVector;
+    // Internal smoothed normal state
+    FVector SmoothedNormalL = FVector::UpVector;
+    FVector SmoothedNormalR = FVector::UpVector;
+
+    bool DoFootTrace(FName IKBoneName, float& OutZTarget, FRotator& OutRotation,
+        FVector& InOutSmoothedNormal, bool& OutHit, float DeltaTime);
 
     void LogTelemetryMessage(int32 Key, const FString& Message, FColor Color);
 };

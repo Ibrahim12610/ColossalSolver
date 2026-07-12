@@ -16,282 +16,178 @@ void UUColossalDetectorComponent::BeginPlay()
     if (Owner)
     {
         OwnerMesh = Owner->FindComponentByClass<USkeletalMeshComponent>();
-        InitialActorLocation = Owner->GetActorLocation();
     }
 
     if (OwnerMesh)
     {
         CachedBoneCount = OwnerMesh->GetNumBones();
-
-        // Initialize stable trace origins from the reference pose once.
-        // Traces are anchored to this position tracked via actor movement delta —
-        // never the live IK-modified bone position. Breaks the feedback loop
-        // where IK output feeds back into trace input (the flicker bug).
-        for (FColossalEffectorTarget& Target : EffectorTargets)
-        {
-            if (OwnerMesh->GetBoneIndex(Target.BoneName) != INDEX_NONE)
-            {
-                Target.StableTraceOrigin = OwnerMesh->GetBoneTransform(
-                    Target.BoneName, ERelativeTransformSpace::RTS_World).GetLocation();
-                Target.bStableOriginInitialized = true;
-            }
-        }
     }
 }
 
-FVector UUColossalDetectorComponent::CalculatePoleVector(FName BendBoneName, float Distance, bool bInvertDirection)
+bool UUColossalDetectorComponent::DoFootTrace(
+    FName IKBoneName,
+    float& OutZTarget,
+    FRotator& OutRotation,
+    FVector& InOutSmoothedNormal,
+    bool& OutHit,
+    float DeltaTime)
 {
-    if (!OwnerMesh) return FVector::ZeroVector;
+    if (!OwnerMesh) return false;
 
-    int32 BoneIndex = OwnerMesh->GetBoneIndex(BendBoneName);
-    if (BoneIndex == INDEX_NONE) return FVector::ZeroVector;
+    int32 BoneIndex = OwnerMesh->GetBoneIndex(IKBoneName);
+    if (BoneIndex == INDEX_NONE)
+    {
+        LogTelemetryMessage(10, FString::Printf(TEXT("Bone not found: %s"), *IKBoneName.ToString()), FColor::Red);
+        return false;
+    }
 
-    FTransform BoneTransform = OwnerMesh->GetBoneTransform(
-        BendBoneName, ERelativeTransformSpace::RTS_World);
+    // Get the current IK foot bone world position
+    FVector BoneWorldPos = OwnerMesh->GetBoneTransform(
+        IKBoneName, ERelativeTransformSpace::RTS_World).GetLocation();
 
-    // GetUnitAxis always returns a proper unit-length vector regardless of any
-    // scale on the bone transform. This avoids the bug where rotating a vector
-    // and then multiplying component-wise by (1,1,1000) produced a near-zero
-    // magnitude result for two of the three axes.
-    FVector BendDirection = BoneTransform.GetUnitAxis(EAxis::Y);
-
-    float SignedDistance = bInvertDirection ? -Distance : Distance;
-
-    // Single scalar multiply on the whole vector — correct uniform scaling,
-    // no component-wise multiplication error possible here.
-    return BoneTransform.GetLocation() + (BendDirection * SignedDistance);
-}
-
-void UUColossalDetectorComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
-{
-    Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
-
-    if (!OwnerMesh || EffectorTargets.Num() == 0) return;
-    UWorld* World = GetWorld();
-    if (!World) return;
+    // Trace starts above the bone to ensure we're above terrain even if bone sinks
+    FVector TraceStart = FVector(BoneWorldPos.X, BoneWorldPos.Y, BoneWorldPos.Z + TraceStartOffset);
+    FVector TraceEnd = TraceStart + (FVector::DownVector * TraceLength);
 
     FCollisionQueryParams TraceParams;
     TraceParams.AddIgnoredActor(GetOwner());
     TraceParams.AddIgnoredComponent(OwnerMesh);
     TraceParams.bTraceComplex = true;
 
-    CachedCenterOfMass = CalculateCenterOfMass();
-    DrawDebugSphere(World, CachedCenterOfMass, 25.0f, 12, FColor::Yellow, false, 0.5f, 0, 3.0f);
-    DrawDebugLine(World, CachedCenterOfMass, CachedCenterOfMass + (FVector::DownVector * 500.0f), FColor::Orange, false, 0.5f, 0, 1.5f);
-    LogTelemetryMessage(99, FString::Printf(TEXT("Center of Mass: %s"), *CachedCenterOfMass.ToString()), FColor::Yellow);
+    FHitResult HitResult;
+    FCollisionShape SweepSphere = FCollisionShape::MakeSphere(SweepSphereRadius);
 
-    // Calculate pole vectors once per frame in C++. Each call is independently
-    // scoped with its own bone name argument — no shared state between left and
-    // right, which is what caused the cross-contamination bug in the graph version.
-    LeftPoleVectorPosition = CalculatePoleVector(LeftCalfBoneName, PoleVectorDistance, bInvertLeftPoleDirection);
-    RightPoleVectorPosition = CalculatePoleVector(RightCalfBoneName, PoleVectorDistance, bInvertRightPoleDirection);
+    UWorld* World = GetWorld();
+    if (!World) return false;
 
-    DrawDebugSphere(World, LeftPoleVectorPosition, 50.0f, 8, FColor::Magenta, false, 0.5f, 0, 2.0f);
-    DrawDebugSphere(World, RightPoleVectorPosition, 50.0f, 8, FColor::Cyan, false, 0.5f, 0, 2.0f);
-    LogTelemetryMessage(70, FString::Printf(TEXT("PoleL: %s | PoleR: %s"),
-        *LeftPoleVectorPosition.ToString(), *RightPoleVectorPosition.ToString()), FColor::White);
+    bool bHit = World->SweepSingleByChannel(
+        HitResult, TraceStart, TraceEnd,
+        FQuat::Identity, ECC_Visibility, SweepSphere, TraceParams);
 
-    // Actor movement delta — tracks overall actor movement (walking, falling)
-    // independent of what Control Rig does to individual bone positions.
-    FVector ActorDelta = GetOwner()->GetActorLocation() - InitialActorLocation;
-
-    for (FColossalEffectorTarget& Target : EffectorTargets)
+    // Debug visualization
+    DrawDebugLine(World, TraceStart, bHit ? HitResult.ImpactPoint : TraceEnd,
+        bHit ? FColor::Red : FColor::Green, false, 0.05f, 0, 2.0f);
+    if (bHit)
     {
-        int32 BoneIndex = OwnerMesh->GetBoneIndex(Target.BoneName);
-        if (BoneIndex == INDEX_NONE) continue;
+        DrawDebugSphere(World, HitResult.ImpactPoint, SweepSphereRadius,
+            8, FColor::Red, false, 0.05f, 0, 2.0f);
+    }
 
-        FTransform BoneTransform = OwnerMesh->GetBoneTransform(
-            Target.BoneName, ERelativeTransformSpace::RTS_World);
-        FVector BoneWorldPos = BoneTransform.GetLocation();
+    OutHit = bHit;
 
-        if (Target.CalculatedImpactPoint.IsNearlyZero())
-            Target.CalculatedImpactPoint = BoneWorldPos;
+    if (bHit)
+    {
+        // STEP 1 CORE:
+        // Z offset = how much to move the IK foot bone up or down
+        // from its current animated position to sit on the terrain surface
+        // This is purely a Z value — same as Mannequin IK ZOffset_L/R_Target
+        float ZDiff = HitResult.ImpactPoint.Z - BoneWorldPos.Z;
+        OutZTarget = ZDiff * CorrectionScale;
 
-        if (!Target.bStableOriginInitialized)
+        // Surface normal for foot rotation after FBIK solves
+        FVector SurfaceNormal = HitResult.ImpactNormal.GetSafeNormal();
+        InOutSmoothedNormal = FMath::VInterpTo(
+            InOutSmoothedNormal, SurfaceNormal, DeltaTime, InterpSpeedIncreasing);
+
+        FVector RotAxis = FVector::CrossProduct(FVector::UpVector, InOutSmoothedNormal).GetSafeNormal();
+        float RotAngle = FMath::RadiansToDegrees(
+            FMath::Acos(FMath::Clamp(
+                FVector::DotProduct(FVector::UpVector, InOutSmoothedNormal), -1.0f, 1.0f)));
+
+        if (!RotAxis.IsNearlyZero())
         {
-            Target.StableTraceOrigin = BoneWorldPos - ActorDelta;
-            Target.bStableOriginInitialized = true;
-        }
-
-        // Stable origin for this frame — independent of live IK-modified bone position.
-        // Applied to BOTH feet and hands to prevent flickering on either.
-        FVector StableOrigin = Target.StableTraceOrigin + ActorDelta;
-
-        FVector TraceStart;
-        FVector TraceEnd;
-        FHitResult HitResult;
-        bool bHitOccurred = false;
-
-        if (Target.LimbType == EColossalLimbType::Foot)
-        {
-            TraceStart = FVector(StableOrigin.X, StableOrigin.Y, StableOrigin.Z + 600.0f);
-            TraceEnd = TraceStart + (FVector::DownVector * Target.TraceLength);
-
-            FCollisionShape SweepSphere = FCollisionShape::MakeSphere(Target.SweepSphereRadius);
-            bHitOccurred = World->SweepSingleByChannel(
-                HitResult, TraceStart, TraceEnd,
-                FQuat::Identity, ECC_Visibility, SweepSphere, TraceParams);
-
-            DrawDebugLine(World, TraceStart, TraceEnd, FColor::White, false, 0.5f, 0, 1.0f);
-            DrawDebugSphere(World, TraceStart, Target.SweepSphereRadius, 8, FColor::White, false, 0.5f, 0, 1.0f);
-
-            if (bHitOccurred)
-            {
-                DrawDebugSphere(World, HitResult.ImpactPoint, Target.SweepSphereRadius, 8, FColor::Red, false, 0.5f, 0, 2.0f);
-                DrawDebugLine(World, TraceStart, HitResult.ImpactPoint, FColor::Red, false, 0.5f, 0, 2.0f);
-            }
-            else
-            {
-                DrawDebugSphere(World, TraceEnd, Target.SweepSphereRadius, 8, FColor::Green, false, 0.5f, 0, 1.0f);
-            }
-
-            LogTelemetryMessage(
-                60 + BoneIndex,
-                FString::Printf(TEXT("%s | ImpactZ: %.0f | BoneZ: %.0f | StableZ: %.0f"),
-                    *Target.BoneName.ToString(),
-                    Target.CalculatedImpactPoint.Z, BoneWorldPos.Z, StableOrigin.Z),
-                FColor::Cyan
-            );
-        }
-        else if (Target.LimbType == EColossalLimbType::HandArm)
-        {
-            // Hands use stable origin too — same flicker fix as feet
-            TraceStart = StableOrigin;
-
-            FVector SenseDirection;
-            if (Target.bUseDirectionOverride && !Target.TraceDirectionOverride.IsNearlyZero())
-            {
-                SenseDirection = BoneTransform.TransformVector(
-                    Target.TraceDirectionOverride.GetSafeNormal());
-            }
-            else
-            {
-                FVector ForwardDirection = BoneTransform.GetUnitAxis(EAxis::X);
-                FVector OutwardDirection = BoneTransform.GetUnitAxis(EAxis::Y);
-                SenseDirection = (ForwardDirection * 0.7f + OutwardDirection * 0.3f).GetSafeNormal();
-            }
-            if (SenseDirection.IsNearlyZero()) SenseDirection = FVector::ForwardVector;
-            TraceEnd = TraceStart + (SenseDirection * Target.TraceLength);
-
-            FCollisionShape ArmSphere = FCollisionShape::MakeSphere(Target.SweepSphereRadius);
-            bHitOccurred = World->SweepSingleByChannel(
-                HitResult, TraceStart, TraceEnd,
-                FQuat::Identity, ECC_Visibility, ArmSphere, TraceParams);
-
-            DrawDebugLine(World, TraceStart, TraceEnd, FColor::White, false, 0.5f, 0, 1.0f);
-            DrawDebugSphere(World, TraceStart, Target.SweepSphereRadius, 8, FColor::White, false, 0.5f, 0, 1.0f);
-
-            if (bHitOccurred)
-            {
-                DrawDebugSphere(World, HitResult.ImpactPoint, Target.SweepSphereRadius, 8, FColor::Red, false, 0.5f, 0, 2.0f);
-                DrawDebugLine(World, TraceStart, HitResult.ImpactPoint, FColor::Red, false, 0.5f, 0, 2.0f);
-            }
-            else
-            {
-                DrawDebugSphere(World, TraceEnd, Target.SweepSphereRadius, 8, FColor::Green, false, 0.5f, 0, 1.0f);
-            }
-
-            LogTelemetryMessage(
-                60 + BoneIndex,
-                FString::Printf(TEXT("%s | ImpactZ: %.0f | BoneZ: %.0f | StableZ: %.0f"),
-                    *Target.BoneName.ToString(),
-                    Target.CalculatedImpactPoint.Z, BoneWorldPos.Z, StableOrigin.Z),
-                FColor::Magenta
-            );
+            FQuat TiltQuat = FQuat(RotAxis, FMath::DegreesToRadians(RotAngle));
+            OutRotation = TiltQuat.Rotator();
         }
         else
         {
-            continue;
+            OutRotation = FRotator::ZeroRotator;
         }
 
         LogTelemetryMessage(
-            30 + BoneIndex,
-            FString::Printf(TEXT("%s | Hit:%s | StartZ:%.0f | EndZ:%.0f | Len:%.0f"),
-                *Target.BoneName.ToString(),
-                bHitOccurred ? TEXT("YES") : TEXT("NO"),
-                TraceStart.Z, TraceEnd.Z, Target.TraceLength),
-            bHitOccurred ? FColor::Green : FColor::Red
-        );
+            BoneIndex + 30,
+            FString::Printf(TEXT("%s | Hit:YES | BoneZ:%.0f | SurfZ:%.0f | ZOffset:%.1f"),
+                *IKBoneName.ToString(), BoneWorldPos.Z, HitResult.ImpactPoint.Z, OutZTarget),
+            FColor::Green);
 
-        Target.bIsColliding = bHitOccurred;
+        return true;
+    }
+    else
+    {
+        // No hit — target returns to zero (foot follows base animation)
+        OutZTarget = 0.0f;
+        InOutSmoothedNormal = FMath::VInterpTo(
+            InOutSmoothedNormal, FVector::UpVector, DeltaTime, InterpSpeedDecreasing);
+        OutRotation = FRotator::ZeroRotator;
 
-        if (bHitOccurred)
-        {
-            Target.SmoothedNormal = FMath::VInterpTo(
-                Target.SmoothedNormal, HitResult.ImpactNormal, DeltaTime, 12.0f);
+        LogTelemetryMessage(
+            BoneIndex + 30,
+            FString::Printf(TEXT("%s | Hit:NO | BoneZ:%.0f"), *IKBoneName.ToString(), BoneWorldPos.Z),
+            FColor::Red);
 
-            FVector LimbForward = BoneTransform.GetUnitAxis(EAxis::X);
-            Target.CalculatedDeltaRotation = FMath::RInterpTo(
-                Target.CalculatedDeltaRotation,
-                CalculateAnkleRotation(LimbForward, Target.SmoothedNormal),
-                DeltaTime, 12.0f);
-
-            Target.CalculatedImpactPoint = HitResult.ImpactPoint;
-
-            // Correction delta — relative offset, scaled by per-effector CorrectionScale.
-            // Use in Control Rig as: CurrentBoneGlobalTranslation + CorrectionDelta
-            Target.CorrectionDelta = FVector(
-                HitResult.ImpactPoint.X - StableOrigin.X,
-                HitResult.ImpactPoint.Y - StableOrigin.Y,
-                HitResult.ImpactPoint.Z - StableOrigin.Z
-            ) * Target.CorrectionScale;
-        }
-        else
-        {
-            Target.SmoothedNormal = FMath::VInterpTo(
-                Target.SmoothedNormal, FVector::UpVector, DeltaTime, 8.0f);
-
-            Target.CalculatedDeltaRotation = FMath::RInterpTo(
-                Target.CalculatedDeltaRotation, FRotator::ZeroRotator, DeltaTime, 8.0f);
-
-            Target.CorrectionDelta = FMath::VInterpTo(
-                Target.CorrectionDelta, FVector::ZeroVector, DeltaTime, 8.0f);
-
-            // CalculatedImpactPoint holds last valid position intentionally
-        }
-
-        // Route to named outputs and the map — both available for Control Rig
-        CorrectionTranslations.Add(Target.BoneName, Target.CorrectionDelta);
-        CorrectionRotations.Add(Target.BoneName, Target.CalculatedDeltaRotation);
-
-        if (Target.BoneName == FName("foot_l"))
-        {
-            LeftFootCorrectionDelta = Target.CorrectionDelta;
-            LeftAnkleTargetRotation = Target.CalculatedDeltaRotation;
-        }
-        else if (Target.BoneName == FName("foot_r"))
-        {
-            RightFootCorrectionDelta = Target.CorrectionDelta;
-            RightAnkleTargetRotation = Target.CalculatedDeltaRotation;
-        }
-        else if (Target.BoneName == FName("hand_l"))
-        {
-            LeftHandCorrectionDelta = Target.CorrectionDelta;
-            LeftWristTargetRotation = Target.CalculatedDeltaRotation;
-        }
-        else if (Target.BoneName == FName("hand_r"))
-        {
-            RightHandCorrectionDelta = Target.CorrectionDelta;
-            RightWristTargetRotation = Target.CalculatedDeltaRotation;
-        }
+        return false;
     }
 }
 
-FRotator UUColossalDetectorComponent::CalculateAnkleRotation(const FVector& FootForward, const FVector& SurfaceNormal)
+void UUColossalDetectorComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
 {
-    FVector WorldUp = FVector::UpVector;
-    FVector SurfaceUp = SurfaceNormal.GetSafeNormal();
+    Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
 
-    FVector RotationAxis = FVector::CrossProduct(WorldUp, SurfaceUp).GetSafeNormal();
-    float RotationAngle = FMath::RadiansToDegrees(
-        FMath::Acos(FMath::Clamp(FVector::DotProduct(WorldUp, SurfaceUp), -1.0f, 1.0f))
-    );
+    if (!OwnerMesh) return;
+    UWorld* World = GetWorld();
+    if (!World) return;
 
-    if (RotationAxis.IsNearlyZero())
-        return FRotator::ZeroRotator;
+    // Update COM
+    CachedCenterOfMass = CalculateCenterOfMass();
 
-    FQuat TiltQuat = FQuat(RotationAxis, FMath::DegreesToRadians(RotationAngle));
-    return TiltQuat.Rotator();
+    // =============================================
+    // STEP 1: Trace both feet and set Z offset targets
+    // Matches: Branch(bShouldDoIKTrace) → FootTrace → Set ZOffset_L/R_Target
+    // =============================================
+    if (bShouldDoIKTrace)
+    {
+        DoFootTrace(LeftIKFootBoneName, ZOffsetL_Target, LeftFootRotation,
+            SmoothedNormalL, bLeftFootHit, DeltaTime);
+
+        DoFootTrace(RightIKFootBoneName, ZOffsetR_Target, RightFootRotation,
+            SmoothedNormalR, bRightFootHit, DeltaTime);
+    }
+    else
+    {
+        // bShouldDoIKTrace is false — reset all targets to zero
+        // Matches the False branch in Mannequin IK
+        ZOffsetL_Target = 0.0f;
+        ZOffsetR_Target = 0.0f;
+        bLeftFootHit = false;
+        bRightFootHit = false;
+    }
+
+    // =============================================
+    // STEP 2: Interpolate Z offsets toward their target values
+    // Matches: Alpha Interpolate nodes with InterpSpeedIncreasing/Decreasing
+    // Use increasing speed when offset is growing, decreasing when shrinking
+    // =============================================
+    float SpeedL = (ZOffsetL_Target > ZOffsetL) ? InterpSpeedIncreasing : InterpSpeedDecreasing;
+    float SpeedR = (ZOffsetR_Target > ZOffsetR) ? InterpSpeedIncreasing : InterpSpeedDecreasing;
+
+    ZOffsetL = FMath::FInterpTo(ZOffsetL, ZOffsetL_Target, DeltaTime, SpeedL);
+    ZOffsetR = FMath::FInterpTo(ZOffsetR, ZOffsetR_Target, DeltaTime, SpeedR);
+
+    // =============================================
+    // STEP 3: Use the lowest foot offset for the pelvis
+    // Prevents overextension when one foot is much higher than the other
+    // Matches: Less comparison → Select → Set ZOffset_Pelvis
+    // =============================================
+    ZOffsetPelvis = FMath::Min(ZOffsetL, ZOffsetR);
+
+    // Debug
+    LogTelemetryMessage(99, FString::Printf(
+        TEXT("L_Offset:%.1f | R_Offset:%.1f | Pelvis:%.1f | ShouldTrace:%s"),
+        ZOffsetL, ZOffsetR, ZOffsetPelvis,
+        bShouldDoIKTrace ? TEXT("YES") : TEXT("NO")),
+        FColor::Yellow);
+
+    DrawDebugSphere(World, CachedCenterOfMass, 25.0f, 12, FColor::Yellow, false, 0.05f, 0, 3.0f);
 }
 
 FVector UUColossalDetectorComponent::CalculateCenterOfMass()
@@ -347,6 +243,6 @@ void UUColossalDetectorComponent::LogTelemetryMessage(int32 Key, const FString& 
 {
     if (GEngine)
     {
-        GEngine->AddOnScreenDebugMessage(Key, 0.03f, Color, Message);
+        GEngine->AddOnScreenDebugMessage(Key, 0.05f, Color, Message);
     }
 }
